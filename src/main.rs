@@ -1,7 +1,18 @@
 use core::time;
 
-use reqwest::{ClientBuilder, StatusCode};
+// use reqwest::{ClientBuilder, StatusCode};
 use structopt::StructOpt;
+use std::env;
+
+// use bytes::Bytes;
+use http_body_util::{BodyExt, Empty};
+use hyper::Request;
+use tokio::io::{self, AsyncWriteExt as _};
+use tokio::net::TcpStream;
+
+use hyper::body::Bytes;
+use hyper_util::rt::TokioIo;
+
 
 
 
@@ -15,7 +26,7 @@ struct Opt {
     tps: u64,
 
     // request sleep (ms)
-    #[structopt(short = "t", long="thread_num", default_value = "0")]
+    #[structopt(short = "t", long="thread_num", default_value = "10")]
     thread_num: u64,
 
     // request level tcp or http (ms)
@@ -25,18 +36,26 @@ struct Opt {
     // request level tcp or http (ms)
     #[structopt(short = "rt", long="reqtm", default_value = "6000")]
     request_timeout: u64,
+
+     // request level tcp or http (ms)
+     #[structopt(long="uri", default_value = "http://localhost:8080/")]
+     request_uri: String,
+
+
 }
 
 
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+// async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::from_args();
-    let uri = "http://localhost:8080/";
-    let thread_num = 1u64;
-    let syn_timeout = 6000; // ms
-    let request_timeout = 6000; // ms
-    let tps: u64 = 10; //_000_000;
+    let uri = opt.request_uri;
+    let thread_num = opt.thread_num;
+    let syn_timeout = opt.syn_timeout; // ms
+    let request_timeout = opt.request_timeout; // ms
+    let tps: u64 = opt.tps; //_000_000;
     let tps_per_thread = tps / thread_num;
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
@@ -93,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _x in 0..thread_num {
         let st = syn_timeout;
         let rt = request_timeout;
-        let uri = uri;
+        let uri = uri.clone();
         let cs = count_sender.clone();
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval_time);
@@ -102,6 +121,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // println!("->{} {:?}", x, );
                 ticker.tick().await;
                 let now = tokio::time::Instant::now();
+
+                let url = uri.parse::<hyper::Uri>()?;
+                // Get the host and the port
+                let host = url.host().expect("uri has no host");
+                let port = url.port_u16().unwrap_or(80);
+                let address = format!("{}:{}", host, port);
+                // Open a TCP connection to the remote host
+                let stream = TcpStream::connect(address).await?;
+                let io = TokioIo::new(stream);
+                let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+                if let Err(err) = conn.await {
+                    println!("Connection failed: {:?}", err);
+                }
+                // The authority of our URL will be the hostname of the httpbin remote
+                let authority = url.authority().unwrap().clone();
+
+                // Create an HTTP request with an empty body and a HOST header
+                let req = Request::builder()
+                    .uri(url)
+                    .header(hyper::header::HOST, authority.as_str())
+                    .body(Empty::<Bytes>::new())?;
+
+                // Await the response...
+                let mut res = sender.send_request(req).await?;
+
+                println!("Response status: {}", res.status());
                 let client = ClientBuilder::new()
                 .connect_timeout(std::time::Duration::from_millis(st))
                 .timeout(std::time::Duration::from_millis(rt))
@@ -111,10 +156,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // println!("{:?}[new]", now.elapsed());
 
                 // let now = tokio::time::Instant::now();
-                if let Ok(resp) = client.get(uri).send().await {
+                if let Ok(resp) = client.get(&uri).send().await {
                     if resp.status().is_success() {
                         // println!("{:?}[OK]", now.elapsed());
-
                         cs.send((1, now.elapsed())).unwrap();
                     }
                 } else {
