@@ -1,55 +1,48 @@
 use core::time;
 
 // use reqwest::{ClientBuilder, StatusCode};
-use structopt::StructOpt;
 use std::env;
+use structopt::StructOpt;
 
 // use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
-use hyper::Request;
+use hyper::{Request, StatusCode};
 use tokio::io::{self, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
 
-
-
-
-
 #[derive(Debug, StructOpt, Clone)]
 #[structopt(name = "tcp-listen", about = "An example of StructOpt usage.")]
 struct Opt {
     /// Activate debug mode
     // short and long flags (-d, --debug) will be deduced from the field's name
-    #[structopt(short = "q", long = "qps", default_value = "1000")]
+    #[structopt(short = "q", long = "qps", default_value = "100")]
     tps: u64,
 
     // request sleep (ms)
-    #[structopt(short = "t", long="thread_num", default_value = "10")]
+    #[structopt(short = "t", long = "thread_num", default_value = "10")]
     thread_num: u64,
 
     // request level tcp or http (ms)
-    #[structopt(short = "st", long="syntm", default_value = "6000")]
+    #[structopt(short = "st", long = "syntm", default_value = "6000")]
     syn_timeout: u64,
 
     // request level tcp or http (ms)
-    #[structopt(short = "rt", long="reqtm", default_value = "6000")]
+    #[structopt(short = "rt", long = "reqtm", default_value = "6000")]
     request_timeout: u64,
 
-     // request level tcp or http (ms)
-     #[structopt(long="uri", default_value = "http://localhost:8080/")]
-     request_uri: String,
-
-
+    // request level tcp or http (ms)
+    #[structopt(long = "uri", default_value = "http://localhost:80/")]
+    request_uri: String,
 }
-
-
 
 #[tokio::main]
 
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+    // async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::from_args();
     let uri = opt.request_uri;
     let thread_num = opt.thread_num;
@@ -60,7 +53,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     use tokio::sync::mpsc;
-    let (count_sender, mut count_receiver) = mpsc::unbounded_channel::<(u8, tokio::time::Duration)>();
+    let (count_sender, mut count_receiver) =
+        mpsc::unbounded_channel::<(u8, tokio::time::Duration)>();
     let count_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(tokio::time::Duration::from_millis(1000));
         let mut count = 0;
@@ -122,52 +116,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 ticker.tick().await;
                 let now = tokio::time::Instant::now();
 
-                let url = uri.parse::<hyper::Uri>()?;
+                let url = uri.parse::<hyper::Uri>().unwrap();
                 // Get the host and the port
                 let host = url.host().expect("uri has no host");
                 let port = url.port_u16().unwrap_or(80);
                 let address = format!("{}:{}", host, port);
                 // Open a TCP connection to the remote host
-                let stream = TcpStream::connect(address).await?;
+                let now = tokio::time::Instant::now();
+
+                const CONNECTION_TIME: u64 = 100;
+                let stream_result = match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(5),
+                    tokio::net::TcpStream::connect(address), // 默认4s超时
+                )
+                .await
+                {
+                    Ok(ok) => ok,
+                    Err(e) => { // 连接失败了
+                        println!("connect timeout");
+                        cs.send((0, now.elapsed())).unwrap();
+                        continue;
+                    }
+                };
+
+                let stream = match stream_result {
+                    Ok(s) => s,
+                    Err(e) => {
+                        cs.send((0, now.elapsed())).unwrap();
+                        // println!("connect timeout{}", e.kind());
+                        continue;
+                    }
+                };
+                // .expect("Error while connecting to server");
                 let io = TokioIo::new(stream);
-                let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
-                if let Err(err) = conn.await {
-                    println!("Connection failed: {:?}", err);
-                }
-                // The authority of our URL will be the hostname of the httpbin remote
+                let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+                tokio::task::spawn(async move {
+                    if let Err(err) = conn.await {
+                        println!("Connection failed: {:?}", err);
+                    }
+                });
                 let authority = url.authority().unwrap().clone();
 
                 // Create an HTTP request with an empty body and a HOST header
                 let req = Request::builder()
                     .uri(url)
                     .header(hyper::header::HOST, authority.as_str())
-                    .body(Empty::<Bytes>::new())?;
+                    .body(Empty::<Bytes>::new())
+                    .unwrap();
 
                 // Await the response...
-                let mut res = sender.send_request(req).await?;
+                let mut res = sender.send_request(req).await.unwrap();
 
-                println!("Response status: {}", res.status());
-                let client = ClientBuilder::new()
-                .connect_timeout(std::time::Duration::from_millis(st))
-                .timeout(std::time::Duration::from_millis(rt))
-                .tcp_nodelay(false)
-                .build()
-                .unwrap();
-                // println!("{:?}[new]", now.elapsed());
-
-                // let now = tokio::time::Instant::now();
-                if let Ok(resp) = client.get(&uri).send().await {
-                    if resp.status().is_success() {
-                        // println!("{:?}[OK]", now.elapsed());
-                        cs.send((1, now.elapsed())).unwrap();
-                    }
+                if res.status() == StatusCode::OK {
+                    // println!("Response status: {}", res.status());
+                    cs.send((1, now.elapsed())).unwrap();
                 } else {
-                    // println!("{}[TM]", x);
+                    println!("Error status: {}", res.status());
                     cs.send((0, now.elapsed())).unwrap();
                 }
-                // cs.send((0, now.elapsed())).unwrap();
-                // drop(client);
-                // println!("<-{} {:?}", x, tokio::time::Instant::now());
             }
         });
         handles.push(handle);
@@ -178,7 +184,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     count_task.await.unwrap();
     Ok(())
 }
-
 
 // [dependencies]
 // reqwest = { version = "0.11", features = ["json"] }
