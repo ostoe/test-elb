@@ -3,7 +3,6 @@ use core::time;
 // use reqwest::{ClientBuilder, StatusCode};
 use std::env;
 use structopt::StructOpt;
-
 // use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
 use hyper::{Request, StatusCode};
@@ -34,13 +33,79 @@ struct Opt {
     request_timeout: u64,
 
     // request level tcp or http (ms)
-    #[structopt(long = "uri", default_value = "http://localhost:80/")]
+    #[structopt(short = "u", long = "uri", default_value = "http://localhost:80/")]
     request_uri: String,
 }
 
 #[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> { 
+    let now = tokio::time::Instant::now();
+    let url = "http://localhost:80/".parse::<hyper::Uri>().unwrap();
+    // Get the host and the port
+    let host = url.host().expect("uri has no host");
+    let port = url.port_u16().unwrap_or(80);
+    let address = format!("{}:{}", host, port);
+    println!("50 {:?}", now.elapsed());
+    const CONNECTION_TIME: u64 = 100;
+    let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    // let stream_result = match tokio::time::timeout(
+    //     tokio::time::Duration::from_secs(5),
+    //     tokio::net::TcpStream::connect(address), // 默认4s超时 花了3ms？？？why
+    // )
+    // .await
+    // {
+    //     Ok(ok) => ok,
+    //     Err(e) => { // 连接失败了
+    //         println!("connect timeout");
+    //         panic!("fff")
+    //     }
+    // };
 
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // let stream = match stream_result {
+    //     Ok(s) => s,
+    //     Err(e) => {
+    //         println!("connect timeout{}", e.kind());
+    //         panic!("---")
+    //     }
+    // };
+    println!("71 {:?}", now.elapsed());
+    // .expect("Error while connecting to server");
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    tokio::task::spawn(async move {
+        if let Err(err) = conn.await {
+            println!("Connection failed: {:?}", err);
+        }
+    });
+    let authority = url.authority().unwrap().clone();
+
+    // Create an HTTP request with an empty body and a HOST header
+    let req = Request::builder()
+        .method("GET")
+        .uri( "/")//url)
+        .header(hyper::header::HOST, authority.as_str())
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    println!("89 {:?}", now.elapsed());
+    // Await the response...
+    let mut res = sender.send_request(req).await.unwrap();
+    println!("92 {:?}", now.elapsed());
+    if res.status() == StatusCode::OK {
+        println!("Response status: {}", res.status());
+    } else {
+        println!("Error status: {} {:?}", res.status(), res);
+    }
+    println!("98 {:?}", now.elapsed());
+
+    return Ok(())
+
+
+}
+
+
+
+
+async fn main1() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::from_args();
@@ -102,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
     let interval_time =
         tokio::time::Duration::from_micros((1.0 / (tps_per_thread as f64) * 1000_000.0) as u64); // us
-    println!("time{:?}", interval_time);
+    println!("time {:?}", interval_time);
     for _x in 0..thread_num {
         let st = syn_timeout;
         let rt = request_timeout;
@@ -159,6 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 // Create an HTTP request with an empty body and a HOST header
                 let req = Request::builder()
+                .method("GET")
                     .uri(url)
                     .header(hyper::header::HOST, authority.as_str())
                     .body(Empty::<Bytes>::new())
